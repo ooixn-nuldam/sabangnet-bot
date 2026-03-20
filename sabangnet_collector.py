@@ -1,12 +1,19 @@
 import os
 import asyncio
+import threading
 import pandas as pd
 from datetime import datetime
+from flask import Flask, jsonify
+from flask_cors import CORS
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 import requests
 
-# 1. 환경 변수 로드 (Railway 설정값)
+# Flask 설정 및 CORS 허용 (Next.js 연동용)
+app = Flask(__name__)
+CORS(app)
+
+# 1. 환경 변수 로드
 SABANGNET_ID = os.environ.get("SABANGNET_ID")
 SABANGNET_PW = os.environ.get("SABANGNET_PW")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -18,76 +25,68 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def send_discord_log(message):
     if DISCORD_WEBHOOK:
-        requests.post(DISCORD_WEBHOOK, json={"content": message})
+        try:
+            requests.post(DISCORD_WEBHOOK, json={"content": message})
+        except Exception as e:
+            print(f"디스코드 전송 실패: {e}")
 
-async def run_collector():
+async def run_collector_logic():
+    """실제 사방넷 수집 핵심 로직"""
     async with async_playwright() as p:
-        # 브라우저 실행 (Railway 환경에 맞게 headless 모드)
+        # 서버 환경 최적화 실행
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(viewport={'width': 1280, 'height': 800})
         page = await context.new_page()
 
         try:
-            print(f"[{datetime.now()}] 사방넷 접속 중...")
-            # 사방넷 로그인 페이지 (URL은 실제 로그인 주소로 확인 필요)
-            await page.goto("https://www.sabangnet.co.kr/login.html") 
-
+            print(f"[{datetime.now()}] 사방넷 수집 시작...")
+            
             # Step 1: 로그인
+            await page.goto("https://www.sabangnet.co.kr/login.html") 
             await page.fill('input[placeholder="아이디를 입력해주세요."]', SABANGNET_ID)
             await page.fill('input[placeholder="비밀번호를 입력해주세요."]', SABANGNET_PW)
             await page.click('button:has-text("로그인")')
             await page.wait_for_load_state("networkidle")
-            print("로그인 성공")
-
-            # Step 2: 문의 수집 메뉴 이동 및 수집 클릭 (예시 선택자)
-            # ※ 실제 사방넷 메뉴 구조에 따라 selector 수정이 필요할 수 있습니다.
-            await page.goto("https://www.sabangnet.co.kr/admin/inquiry/collect") # 가상 경로
-            await page.click("#all_check_box") # 전체 선택
-            await page.click("button:has-text('쇼핑몰 문의수집')")
             
-            print("문의 수집 시작... 5분 대기")
-            await asyncio.sleep(300) # 수집 완료까지 대기
-
-            # Step 3: 엑셀 다운로드 및 데이터 읽기
-            # (실제 환경에서는 다운로드 이벤트를 캡처해야 함)
-            async with page.expect_download() as download_info:
-                await page.click("button:has-text('다운로드')")
-            download = await download_info.value
-            path = f"./temp_inquiries_{datetime.now().strftime('%Y%m%d%H%M')}.xlsx"
-            await download.save_as(path)
-
-            # Step 4: Pandas로 엑셀 분석 및 Supabase 저장
-            df = pd.read_excel(path)
-            new_items_count = 0
-
-            for index, row in df.iterrows():
-                # 중복 확인 (주문번호 기준 등)
-                check = supabase.table("inquiries").select("id").eq("order_number", str(row['주문번호'])).execute()
-                
-                if not check.data:
-                    data = {
-                        "site_name": row.get('쇼핑몰명'),
-                        "seller_id": row.get('판매자ID'),
-                        "order_number": str(row.get('주문번호')),
-                        "inquiry_type": row.get('문의제목'),
-                        "product_name": row.get('상품명'),
-                        "content": row.get('문의내용'),
-                        "customer_name": row.get('작성자'),
-                        "status": "대기",
-                        "created_at": str(row.get('고객등록일자')),
-                        "collected_at": datetime.now().isoformat()
-                    }
-                    supabase.table("inquiries").insert(data).execute()
-                    new_items_count += 1
-
-            send_discord_log(f"✅ 수집 완료: 신규 문의 {new_items_count}건 등록되었습니다.")
+            # TODO: 실제 사방넷 내부 메뉴 클릭 및 엑셀 다운로드 로직 고도화 필요
+            # 현재는 연동 확인을 위한 더미 로그를 생성합니다.
+            print("로그인 성공 및 메뉴 진입 시도")
             
+            # 예시: 완료 후 알림
+            send_discord_log("✅ [사방넷 봇] 수집 프로세스가 성공적으로 시작되었습니다. (세부 로직 고도화 대기 중)")
+
         except Exception as e:
-            error_msg = f"❌ 에러 발생: {str(e)}"
+            error_msg = f"❌ [사방넷 봇] 에러 발생: {str(e)}"
             print(error_msg)
             send_discord_log(error_msg)
         finally:
             await browser.close()
 
+# --- API 엔드포인트 ---
+
+@app.route('/collect', methods=['POST'])
+def start_collect():
+    """Next.js 웹 버튼 클릭 시 호출됨"""
+    # 백그라운드 스레드에서 수집기 실행 (웹 응답은 즉시 반환)
+    def interrupt_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_collector_logic())
+        loop.close()
+
+    thread = threading.Thread(target=interrupt_loop)
+    thread.start()
+    
+    return jsonify({
+        "status": "success", 
+        "message": "수집 프로세스가 백그라운드에서 시작되었습니다."
+    }), 200
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return "OK", 200
+
 if __name__ == "__main__":
-    asyncio.run(run_collector())
+    # Railway가 부여하는 PORT 번호로 실행
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
