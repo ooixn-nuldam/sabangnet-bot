@@ -18,6 +18,8 @@ SABANGNET_PW    = os.getenv("SABANGNET_PW")
 SUPABASE_URL    = os.getenv("SUPABASE_URL")
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY")
 EXCEL_SAVE_PATH = "/tmp/sabangnet_excel"
+# 세션 파일 경로 (깃허브 루트에 올렸을 경우)
+AUTH_STATE_PATH = "auth_state.json"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 app = FastAPI()
@@ -30,7 +32,7 @@ app.add_middleware(
 )
 
 # ================================================
-# 2. Supabase 저장 로직 (엑셀 파싱)
+# 2. Supabase 저장 로직 (변동 없음)
 # ================================================
 async def save_to_supabase(filepath: str):
     print(f"엑셀 파일 읽기 및 Supabase 저장 시작: {filepath}")
@@ -86,7 +88,7 @@ async def save_to_supabase(filepath: str):
     return new_count
 
 # ================================================
-# 3. 사방넷 수집 자동화 메인 로직 (로그인 대응 강화)
+# 3. 사방넷 수집 자동화 메인 로직 (세션 주입 적용)
 # ================================================
 async def collect_sabangnet_logic():
     print(f"[{datetime.now()}] 사방넷 수집 프로세스 가동")
@@ -97,69 +99,78 @@ async def collect_sabangnet_logic():
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
-        # 세션 유지를 위해 context 설정 및 타임아웃 연장
-        context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+        
+        # --- [중요] 세션 파일(auth_state.json) 로드 로직 ---
+        try:
+            if os.path.exists(AUTH_STATE_PATH):
+                print(f"✅ {AUTH_STATE_PATH} 파일을 발견했습니다. 세션을 주입합니다.")
+                context = await browser.new_context(
+                    storage_state=AUTH_STATE_PATH,
+                    viewport={'width': 1920, 'height': 1080}
+                )
+            else:
+                print("⚠️ 세션 파일이 없습니다. 일반 컨텍스트를 생성합니다.")
+                context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+        except Exception as e:
+            print(f"🔴 세션 로드 중 오류 발생: {e}")
+            context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
+
         page = await context.new_page()
-        page.set_default_timeout(60000) # 타임아웃 60초로 상향
+        page.set_default_timeout(60000)
 
         try:
-            # --- 1. 로그인 상태 확인 ---
-            print("로그인 상태 확인 중...")
-            # 대시보드 주소로 먼저 접속 시도
+            # --- 1. 로그인 상태 확인 및 조건부 로그인 ---
+            print("사방넷 접속 및 로그인 상태 확인 중...")
             await page.goto("https://sbadmin15.sabangnet.co.kr/#/dashboard", wait_until="domcontentloaded")
             await page.wait_for_timeout(3000)
 
-            # 현재 URL이나 특정 요소를 보고 로그인이 필요한지 판단
+            # 세션 주입이 성공했다면 대시보드로 바로 들어가짐. 아니라면 로그인 실행.
             if "login" in page.url or await page.locator('input[name="admin_id"]').is_visible():
-                print("로그인이 필요합니다. 로그인 페이지로 이동...")
+                print("로그인이 만료되었거나 세션이 유효하지 않습니다. 재로그인 시도...")
                 await page.goto("https://www.sabangnet.co.kr/login.html", wait_until="networkidle")
                 await page.fill('input[name="admin_id"]', SABANGNET_ID)
                 await page.fill('input[name="admin_pwd"]', SABANGNET_PW)
                 
-                # 엔터 대신 '접속하기' 버튼 직접 클릭 시도
                 login_btn = page.locator("button:has-text('접속하기'), input[type='submit'], .btn_login")
                 if await login_btn.count() > 0:
                     await login_btn.first.click()
                 else:
                     await page.keyboard.press("Enter")
                 
-                # 로그인 후 대시보드 로딩 대기
                 await page.wait_for_url("**/dashboard", timeout=60000)
-                print("✅ 로그인 성공!")
+                print("✅ 재로그인 성공!")
             else:
-                print("✅ 기존 세션이 유효합니다. 로그인을 건너뜁니다.")
+                print("✅ 세션이 유효합니다. 바로 수집을 시작합니다.")
 
-            # --- 2. 문의 수집 실행 ---
-            print("문의사항 수집 페이지 이동...")
+            # --- 2. 문의 수집 실행 (사용자 요구사항 반영) ---
+            print("STEP 2: 문의사항 수집 페이지 이동...")
             await page.goto("https://sbadmin15.sabangnet.co.kr/#/customer-service/ask-collect", wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
 
-            print("전체 선택 및 수집 시작...")
-            # 체크박스 로딩 대기 후 첫 번째(전체선택) 클릭
+            print("전체 체크박스 선택 및 수집 버튼 클릭...")
             await page.wait_for_selector("input[type='checkbox']")
-            await page.locator("input[type='checkbox']").first.click()
-            
-            # '쇼핑몰 문의수집' 버튼 클릭
+            await page.locator("input[type='checkbox']").first.click() # 전체 선택
             await page.click("button:has-text('쇼핑몰 문의수집')")
             
-            print("서버 수집 대기 중 (5분)...")
-            await asyncio.sleep(300) # 서버 부하 고려 5분 대기
+            print("⏳ 서버 수집 대기 중 (5분)...")
+            await asyncio.sleep(300) 
 
             # --- 3. 문의 답변 페이지 이동 및 엑셀 다운로드 ---
-            print("문의사항 답변 페이지로 이동...")
+            print("STEP 3: 문의사항 답변 페이지로 이동...")
             await page.goto("https://sbadmin15.sabangnet.co.kr/#/customer-service/ask-answer", wait_until="domcontentloaded")
             await page.wait_for_timeout(5000)
 
             excel_filename = f"sabangnet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             excel_filepath = os.path.join(EXCEL_SAVE_PATH, excel_filename)
 
-            print("엑셀 다운로드 시도...")
+            print("우측 상단 다운로드 버튼 클릭 시도...")
             async with page.expect_download() as download_info:
+                # 파란색 다운로드 버튼 타겟팅
                 await page.click("button:has-text('다운로드')")
             
             download = await download_info.value
             await download.save_as(excel_filepath)
-            print(f"엑셀 다운로드 완료: {excel_filepath}")
+            print(f"✅ 엑셀 다운로드 완료: {excel_filepath}")
 
             # --- 4. Supabase 저장 호출 ---
             await save_to_supabase(excel_filepath)
@@ -170,9 +181,7 @@ async def collect_sabangnet_logic():
             await browser.close()
             print("브라우저 종료")
 
-# ================================================
-# 4. API 서버 엔드포인트
-# ================================================
+# [API 엔드포인트 및 서버 실행 부분은 이전과 동일]
 @app.post("/collect")
 async def start_collect(background_tasks: BackgroundTasks):
     background_tasks.add_task(collect_sabangnet_logic)
