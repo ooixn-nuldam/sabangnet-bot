@@ -3,5 +3,4 @@ uvicorn
 playwright
 openpyxl
 supabase
-aiohttp
-python-dotenv
+python-multipart
