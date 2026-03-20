@@ -12,6 +12,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
+    
+RUN playwright install --with-deps chromium
 
 # 5. 소스 코드 복사
 COPY . .
