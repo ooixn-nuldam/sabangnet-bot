@@ -99,98 +99,73 @@ async def collect_sabangnet_logic():
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
-        
-        # --- [중요] 세션 파일(auth_state.json) 로드 로직 ---
-        try:
-            if os.path.exists(AUTH_STATE_PATH):
-                print(f"✅ {AUTH_STATE_PATH} 파일을 발견했습니다. 세션을 주입합니다.")
-                context = await browser.new_context(
-                    storage_state=AUTH_STATE_PATH,
-                    viewport={'width': 1920, 'height': 1080}
-                )
-            else:
-                print("⚠️ 세션 파일이 없습니다. 일반 컨텍스트를 생성합니다.")
-                context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
-        except Exception as e:
-            print(f"🔴 세션 로드 중 오류 발생: {e}")
-            context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
-
+        context = await browser.new_context(
+            storage_state="auth_state.json",
+            viewport={'width': 1920, 'height': 1080}
+        )
         page = await context.new_page()
-        page.set_default_timeout(60000)
+        # 수집 시간이 길어질 수 있으므로 기본 타임아웃을 10분으로 확장
+        page.set_default_timeout(600000) 
+
+        # 팝업 알럿(확인창) 자동 승인
+        page.on("dialog", lambda dialog: dialog.accept())
 
         try:
-            # --- 1. 로그인 상태 확인 및 조건부 로그인 ---
-            print("사방넷 접속 및 로그인 상태 확인 중...")
-            await page.goto("https://sbadmin15.sabangnet.co.kr/#/dashboard", wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
-
-            # 세션 주입이 성공했다면 대시보드로 바로 들어가짐. 아니라면 로그인 실행.
-            if "login" in page.url or await page.locator('input[name="admin_id"]').is_visible():
-                print("로그인이 만료되었거나 세션이 유효하지 않습니다. 재로그인 시도...")
-                await page.goto("https://www.sabangnet.co.kr/login.html", wait_until="networkidle")
-                await page.fill('input[name="admin_id"]', SABANGNET_ID)
-                await page.fill('input[name="admin_pwd"]', SABANGNET_PW)
-                
-                login_btn = page.locator("button:has-text('접속하기'), input[type='submit'], .btn_login")
-                if await login_btn.count() > 0:
-                    await login_btn.first.click()
-                else:
-                    await page.keyboard.press("Enter")
-                
-                await page.wait_for_url("**/dashboard", timeout=60000)
-                print("✅ 재로그인 성공!")
-            else:
-                print("✅ 세션이 유효합니다. 바로 수집을 시작합니다.")
-
-            # --- 2. 문의 수집 실행 (사용자 요구사항 반영) ---
-            print("STEP 2: 문의사항 수집 페이지 이동...")
-            await page.goto("https://sbadmin15.sabangnet.co.kr/#/customer-service/ask-collect", wait_until="domcontentloaded")
-            await page.wait_for_timeout(5000)
-
+            # 1. 수집 페이지 접속
+            print("STEP 1: 문의사항 수집 페이지 이동...")
+            await page.goto("https://sbadmin15.sabangnet.co.kr/#/customer-service/ask-collect")
+            
+            # 2. 전체 선택 및 수집 시작
             print("전체 체크박스 선택 및 수집 버튼 클릭...")
-            await page.wait_for_selector("input[type='checkbox']")
-            await page.locator("input[type='checkbox']").first.click() # 전체 선택
+            await page.wait_for_selector("thead input[type='checkbox']")
+            await page.locator("thead input[type='checkbox']").first.click()
             await page.click("button:has-text('쇼핑몰 문의수집')")
             
-            print("⏳ 서버 수집 대기 중 (5분)...")
-            await asyncio.sleep(300) 
+            # --- [핵심 수정] 5분 대기 대신 '닫기' 버튼 감지 ---
+            print("⏳ 사방넷 수집 진행 중... 완료 대기 (닫기 버튼 감지 중)")
+            
+            # 수집 완료 후 나타나는 [닫기] 버튼이 보일 때까지 대기
+            # 이미지(image_7d6767.png)를 기반으로 버튼 텍스트나 클래스 타겟팅
+            close_btn_selector = "button:has-text('닫기'), .btn_close, input[value='닫기']"
+            try:
+                # 최대 10분간 닫기 버튼이 나오길 기다림
+                close_btn = page.locator(close_btn_selector).last
+                await close_btn.wait_for(state="visible", timeout=600000)
+                print(f"✅ 수집 완료 확인됨 ({datetime.now().strftime('%H:%M:%S')})")
+                
+                # 닫기 버튼 클릭하여 팝업 종료
+                await close_btn.click()
+                await page.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"⚠️ 닫기 버튼 감지 실패 또는 시간 초과: {e}")
+                print("진행률 확인이 어려우나 다음 단계로 강제 진입합니다.")
 
-            # --- 3. 문의 답변 페이지 이동 및 엑셀 다운로드 ---
-            print("STEP 3: 문의사항 답변 페이지로 이동...")
-            await page.goto("https://sbadmin15.sabangnet.co.kr/#/customer-service/ask-answer", wait_until="domcontentloaded")
-            await page.wait_for_timeout(5000)
+            # 3. 문의 답변 페이지 이동 및 엑셀 다운로드
+            print("STEP 2: 문의사항 답변 페이지로 이동...")
+            await page.goto("https://sbadmin15.sabangnet.co.kr/#/customer-service/ask-answer")
+            
+            # 검색 버튼 클릭 (데이터 로딩)
+            print("검색 버튼 클릭하여 리스트 호출...")
+            await page.locator("button:has-text('검색')").first.click()
+            await page.wait_for_timeout(3000)
 
             excel_filename = f"sabangnet_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             excel_filepath = os.path.join(EXCEL_SAVE_PATH, excel_filename)
 
-            print("우측 상단 다운로드 버튼 클릭 시도...")
+            print("엑셀 다운로드 시작 (우측 상단 파란색 버튼)...")
             async with page.expect_download() as download_info:
-                # 파란색 다운로드 버튼 타겟팅
-                await page.click("button:has-text('다운로드')")
+                # '다운로드' 텍스트를 포함한 버튼 클릭
+                await page.locator("button:has-text('다운로드')").first.click()
             
             download = await download_info.value
             await download.save_as(excel_filepath)
-            print(f"✅ 엑셀 다운로드 완료: {excel_filepath}")
+            print(f"✅ 엑셀 다운로드 성공: {excel_filepath}")
 
-            # --- 4. Supabase 저장 호출 ---
+            # 4. Supabase 저장
             await save_to_supabase(excel_filepath)
 
         except Exception as e:
-            print(f"🔴 수집 프로세스 중 오류 발생: {str(e)}")
+            print(f"🔴 오류 발생: {str(e)}")
         finally:
             await browser.close()
             print("브라우저 종료")
-
-# [API 엔드포인트 및 서버 실행 부분은 이전과 동일]
-@app.post("/collect")
-async def start_collect(background_tasks: BackgroundTasks):
-    background_tasks.add_task(collect_sabangnet_logic)
-    return {"status": "success", "message": "사방넷 수집이 백그라운드에서 시작되었습니다."}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "running", "timestamp": datetime.now().isoformat()}
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
